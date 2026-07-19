@@ -1,183 +1,256 @@
 # Viettel AI Race 2026 — Novel View Synthesis (BTS Digital Twin)
 
-> **Giải đấu AI cho kỹ sư Việt Nam — Bài 1: BTS Digital Twin**
+> **Viettel AI Race — Problem 1: BTS Digital Twin**
 >
-> Tổ chức bởi: **Viettel**
->
-> Trang chủ: [competition.viettel.vn/contests/var-2026](https://competition.viettel.vn/contests/var-2026)
+> Organized by **Viettel** · [competition.viettel.vn/contests/var-2026](https://competition.viettel.vn/contests/var-2026)
 
 ---
 
-## Tổng Quan / Overview
+## Overview
 
-Bài toán yêu cầu xây dựng mô hình AI có khả năng **tái dựng cấu trúc không gian 3D** của một scene từ tập ảnh đa góc nhìn và **sinh ra ảnh tại các góc nhìn mới** (Novel View Synthesis) chưa từng xuất hiện trong dữ liệu đầu vào.
+The goal is to build an AI model that reconstructs a 3D spatial structure of a scene from multi-view images and synthesizes photorealistic RGB images at **novel camera viewpoints** never seen during training.
 
-**Input:** Tập ảnh đa góc nhìn + camera poses + sparse reconstruction từ COLMAP
-
-**Output:** Ảnh RGB tại các test poses được chỉ định
-
-**Đối tượng:** Trạm BTS, công trình hạ tầng viễn thông, các đối tượng thực tế khác
-
-**Lĩnh vực:** Computer Vision · 3D Vision · Neural Rendering · Digital Twin
+| | |
+|---|---|
+| **Input** | Multi-view images + camera poses + COLMAP sparse reconstruction |
+| **Output** | RGB images rendered at specified test poses |
+| **Target objects** | BTS (cell tower) stations, telecom infrastructure, real-world scenes |
+| **Domains** | Computer Vision · 3D Vision · Neural Rendering · Digital Twin |
 
 ---
 
-## Kiến Trúc Dự Án / Project Structure
+## Method: Taming-AbsGS Hybrid
+
+Our approach combines two complementary improvements over the original 3D Gaussian Splatting (3DGS) into a single, patched training pipeline.
+
+### Background: 3D Gaussian Splatting
+
+[3DGS](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) (Kerbl et al., SIGGRAPH 2023) represents a scene as a collection of anisotropic 3D Gaussians. During training, Gaussians are periodically **densified** (cloned or split) based on the magnitude of their view-space positional gradients, then **pruned** to control the total count. While effective, the original heuristic treats all Gaussians uniformly: the same gradient threshold gates both cloning small Gaussians and splitting large ones.
+
+### Taming-3DGS: Score-Based Budget Control
+
+[Taming-3DGS](https://github.com/humansensinglab/taming-3dgs) (Mallick et al., ECCV 2024) addresses the exponential growth and training instability of 3DGS by introducing two key mechanisms:
+
+**1. Gaussian Importance Score.** Each Gaussian is ranked by a multi-factor score that aggregates geometry and photometric signals across all training views:
+
+- **Geometry factors** ($G$): normalized view-space gradient magnitude, opacity, median depth, projected radii, and scale
+- **Photometric factors** ($P$): per-pixel L1 loss, accumulated blending weight, transmittance-weighted distance, and inverse ray count
+
+The importance of Gaussian $i$ for view $v$ is:
+
+$$S_i^{(v)} = w_v \cdot \mathcal{L}_{\text{photo}}^{(v)} \cdot \left(P_i^{(v)} + G_i^{(v)}\right)$$
+
+Scores are summed across all validation views, and only the top-$k$ Gaussians (controlled by a budget schedule) survive densification and pruning. This ensures training stays within a predictable memory envelope.
+
+**2. Budget Scheduling.** The target Gaussian count $B(t)$ follows a quadratic ramp from the initial count $N_0$ to the final budget $B_{\text{final}}$ over $T$ densification steps (Eq. 2 in the paper):
+
+$$B(t) = a t^2 + b t + N_0$$
+
+where $a, b$ are derived from the slope lower bound $\frac{B_{\text{final}} - N_0}{T}$. This prevents both early overshoot and late-stage starvation.
+
+**3. Loss-Guided Rendering.** An edge-aware loss map weights the photometric loss spatially, emphasizing high-detail regions (edges detected via PIL's `FIND_EDGES` filter). The training loss combines L1 and a DSSIM term with the learned loss map.
+
+**4. Post-HO Opacity Mode.** After a harmonic-oscillator (HO) schedule, opacity activations switch to absolute-value mode (`torch.abs`), improving convergence on fine structures.
+
+### AbsGS: Absolute Gradient for Split Qualification
+
+[AbsGS](https://github.com/Zhenyu-Yang22/AbsGS) (Yang et al., 2024) identifies a subtle failure mode in 3DGS densification: the **homodirectional gradient cancellation** problem. When neighboring pixels push a large Gaussian in opposite directions, the signed gradient components cancel out during atomic accumulation, so the Gaussian's gradient norm falls below the densification threshold — even though the Gaussian is clearly under-representing the scene.
+
+AbsGS fixes this by accumulating **per-pixel absolute gradients** ($\sum |\partial \mathcal{L} / \partial x|$, $\sum |\partial \mathcal{L} / \partial y|$) in the CUDA backward pass, alongside the standard signed gradients. Since absolute values never cancel, large, under-resolved Gaussians reliably exceed the split threshold.
+
+### Hybrid Architecture
+
+Our `build_taming_absgs.py` script produces a **patched Taming-3DGS workspace** that integrates AbsGS gradient statistics without replacing Taming's core logic. The hybrid is generated deterministically — no source files in either original repo are modified. The script copies Taming-3DGS into a new writable directory and applies surgical patches across 7 files:
+
+| File patched | Change |
+|---|---|
+| `arguments/__init__.py` | Adds `densify_grad_abs_threshold` (default: `0.0004`) |
+| `gaussian_model.py` | Adds `xyz_gradient_accum_abs` buffer, 4-channel gradient accumulation, hybrid `densify_with_score`, backward-compatible checkpoint restore (supports both 13-tuple Taming-only and 14-tuple hybrid checkpoints) |
+| `gaussian_renderer/__init__.py` | Expands `screenspace_points` from 3 to 4 channels (channels 0–1: signed gradient; channels 2–3: absolute gradient) |
+| `train.py` | Post-HO opacity-mode restore, passes dual thresholds to densification |
+| `submodules/diff-gaussian-rasterization/rasterize_points.cu` | 4-channel `dL_dmeans2D` tensor |
+| `submodules/diff-gaussian-rasterization/cuda_rasterizer/backward.h` | `float4*` declarations |
+| `submodules/diff-gaussian-rasterization/cuda_rasterizer/backward.cu` | Absolute gradient accumulators (`fabs`), atomic-add to channels 2–3 |
+
+**The key design principle:** Taming's score-based sampling and budget schedule remain fully intact. AbsGS only changes **which large Gaussians are eligible** for splitting:
+
+```
+Clone candidates  →  norm(signed_gradient) >= densify_grad_threshold     (Taming default)
+Split candidates  →  norm(abs_gradient)    >= densify_grad_abs_threshold  (AbsGS contribution)
+```
+
+Small Gaussians ($\max(\text{scale}) \le \text{percent\_dense} \times \text{extent}$) are cloned using Taming's normal gradient — preserving the ability to populate empty regions. Large Gaussians ($\max(\text{scale}) > \text{percent\_dense} \times \text{extent}$) are split using AbsGS's absolute gradient — preventing the cancellation problem on under-resolved structures. Taming scores still **rank** all candidates, so the budget schedule and quality-driven pruning remain in effect.
+
+### Scoring Formula
+
+The competition evaluates rendered images against hidden ground truth using a weighted combination:
+
+$$\text{Score} = 0.4 \times (1 - \text{LPIPS}) + 0.3 \times \text{SSIM} + 0.3 \times \text{PSNR}_\text{norm}$$
+
+| Metric | What it measures | Target |
+|---|---|---|
+| **LPIPS** (Zhang et al., CVPR 2018) | Perceptual similarity via deep features (AlexNet) | Lower |
+| **SSIM** | Structural similarity (luminance, contrast, structure) | Higher |
+| **PSNR** (normalized) | Pixel-level error, clamped to $[0, 1]$ | Higher |
+
+The leaderboard score is the **average across all scenes**.
+
+---
+
+## Project Structure
 
 ```
 ViettelAIRace2026/
-├── VAI_NVS_CODE/                  # Mã nguồn chính
-│   ├── scripts/                   # Pipeline scripts
-│   │   ├── train_parallel.py      # Training đa GPU / đa scene
-│   │   ├── render_parallel.py     # Render đa GPU / đa scene
-│   │   ├── evaluate_predictions.py # Đánh giá local (LPIPS/SSIM/PSNR)
-│   │   ├── render_poses.py        # Render từ checkpoint
-│   │   ├── nvs_utils.py           # Tiện ích dùng chung
-│   │   ├── inspect_dataset.py     # Kiểm tra dataset
-│   │   ├── verify_colmap_scene.py # Xác minh COLMAP scene
-│   │   ├── build_taming_absgs.py  # Build pipeline Taming-3DGS + AbsGS
-│   │   └── verify_taming_absgs.py # Verify pipeline
-│   └── external/                  # Các phương pháp 3DGS
-│       ├── taming-3dgs/           # Taming-3DGS
-│       └── absgs/                 # AbsGS (anti-aliased 3DGS)
-├── external/                      # Bản sao các external repos
-│   ├── gaussian-splatting/        # 3D Gaussian Splatting gốc
-│   ├── taming-3dgs/               # Taming-3DGS
-│   └── absgs/                     # AbsGS
-├── configs/                       # File cấu hình training
-├── scripts/                       # Scripts tiện ích bổ trợ
-├── tests/                         # Unit tests
-│   ├── test_nvs_utils.py
-│   ├── test_renderer_paths.py
-│   ├── test_cli_contracts.py
-│   └── test_display_scenes.py
-├── docs/                          # Tài liệu
-│   ├── topic.md                   # Chi tiết bài toán
-│   ├── environment_setup.md       # Hướng dẫn cài đặt môi trường
-│   └── phase1_nvs_high_score_plan.md  # Kế hoạch đạt điểm cao
-├── VAI_NVS_DATA/                  # Dữ liệu (KHÔNG lên GitHub)
-│   └── phase1/
-│       ├── public_set/            # 5 scenes (có GT test images)
-│       └── private_set1/          # 8 scenes (không có GT)
-├── outputs/                       # Output training (KHÔNG lên GitHub)
-└── .conda-envs/                   # Conda environment (KHÔNG lên GitHub)
+├── VAI_NVS_CODE/                       # Deployable source bundle (Kaggle-ready)
+│   ├── scripts/                        # Pipeline automation
+│   │   ├── build_taming_absgs.py       #   Generate hybrid Taming-AbsGS workspace
+│   │   ├── verify_taming_absgs.py      #   Validate hybrid workspace integrity
+│   │   ├── train_parallel.py           #   Multi-GPU training launcher
+│   │   ├── render_parallel.py          #   Parallel test-pose rendering (2 GPUs)
+│   │   ├── render_poses.py             #   Single-GPU test-pose renderer
+│   │   ├── evaluate_predictions.py     #   Local scoring (LPIPS/SSIM/PSNR)
+│   │   ├── inspect_dataset.py          #   Dataset structure auditor
+│   │   ├── verify_colmap_scene.py      #   COLMAP model validator
+│   │   ├── show_rendered_images.py     #   Side-by-side render vs. GT viewer
+│   │   ├── nvs_utils.py               #   Shared utilities (path/pose/COLMAP I/O)
+│   │   ├── kaggle_taming_absgs.md      #   Kaggle runbook (single GPU)
+│   │   └── kaggle_taming_absgs_dual_gpu.md  # Kaggle runbook (dual GPU)
+│   └── external/                       # 3DGS variant implementations
+│       ├── taming-3dgs/                #   Taming-3DGS (score-based budget control)
+│       └── absgs/                      #   AbsGS (absolute gradient split)
+├── external/                           # Local copies of external repositories
+│   ├── gaussian-splatting/             #   Original 3DGS (Inria, 2023)
+│   ├── taming-3dgs/                    #   Taming-3DGS
+│   └── absgs/                          #   AbsGS
+├── scripts/                            # Local mirror of VAI_NVS_CODE/scripts/
+├── tests/                              # Pytest test suite
+│   ├── conftest.py                     #   Shared fixtures
+│   ├── test_nvs_utils.py              #   Utility function tests
+│   ├── test_renderer_paths.py          #   Renderer path contract tests
+│   ├── test_cli_contracts.py           #   CLI contract tests
+│   └── test_display_scenes.py          #   Display utility tests
+├── docs/                               # Documentation
+│   ├── topic.md                        #   Competition problem description
+│   ├── environment_setup.md            #   Local environment setup guide
+│   ├── phase1_nvs_high_score_plan.md   #   Phase 1 execution plan
+│   └── superpowers/                    #   Agentic development artifacts
+├── configs/                            # Training configuration files
+├── .gitignore
+├── README.md
+└── LICENSE
 ```
+
+> **Note:** `VAI_NVS_DATA/` (competition dataset, ~5 GB), `outputs/` (checkpoints & renders), `.conda-envs/`, and large binary assets (`.pdf`, `.zip`) are excluded via `.gitignore`. Dataset must be obtained from the competition organizers.
 
 ---
 
-## Phương Pháp
+## Setup
 
-Pipeline sử dụng các biến thể của **3D Gaussian Splatting (3DGS)** làm baseline:
+### Requirements
 
-| Phương pháp | Đặc điểm |
-|---|---|
-| **3D Gaussian Splatting** | Baseline gốc từ [Kerbl et al. 2023](https://github.com/graphdeco-inria/gaussian-splatting) |
-| **Taming-3DGS** | Phiên bản tinh chỉnh với cải thiện về chất lượng rendering và ổn định training |
-| **AbsGS** | Biến thể anti-aliased, giảm artifacts ở các góc nhìn xa |
-
-Chiến lược tổng thể:
-1. **Train** mô hình 3DGS trên mỗi scene với COLMAP sparse model
-2. **Render** ảnh tại test poses
-3. **Evaluate** local score trên public set (có ground truth)
-4. **Package** submission ZIP đúng format BTC yêu cầu
-
----
-
-## Công Thức Tính Điểm
-
-```
-Score = 0.4 × (1 − LPIPS) + 0.3 × SSIM + 0.3 × PSNR_norm
-```
-
-| Metric | Mô tả | Hướng |
-|---|---|---|
-| **LPIPS** | Perceptual similarity (deep features) | Càng thấp càng tốt |
-| **SSIM** | Structural similarity | Càng cao càng tốt |
-| **PSNR** | Pixel-level error (normalized) | Càng cao càng tốt |
-
-Điểm trên bảng xếp hạng là **trung bình của toàn bộ các scene**.
-
----
-
-## Cài Đặt / Setup
-
-### Yêu cầu hệ thống
-
-- **OS:** Windows (hỗ trợ Linux thông qua Kaggle notebook)
-- **GPU:** NVIDIA GPU with CUDA 12.x
+- **OS:** Linux (Kaggle) or Windows (local dev)
+- **GPU:** NVIDIA GPU with CUDA 12.1+
 - **Python:** 3.10+
-- **CUDA Toolkit:** 12.1+
+- **Build tools:** Visual Studio Build Tools (Windows) or GCC (Linux)
 
-### Cài đặt môi trường
+### Environment
 
-```powershell
-# Tạo conda environment
+```bash
+# Create conda environment
 conda create -n gaussian_splatting python=3.10
 conda activate gaussian_splatting
 
-# Cài PyTorch với CUDA
+# Install PyTorch with CUDA 12.1
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# Cài các dependencies
-pip install plyfile tqdm opencv-python pillow numpy scipy
+# Base dependencies
+pip install plyfile tqdm opencv-python pillow numpy scipy matplotlib lpips
 
-# Build CUDA extensions (yêu cầu Visual Studio Build Tools)
-# Từ thư mục VAI_NVS_CODE/external/taming-3dgs:
+# Build CUDA extensions from the hybrid workspace
 pip install -e submodules/diff-gaussian-rasterization
 pip install -e submodules/simple-knn
 pip install -e submodules/fused-ssim
 ```
 
-Chi tiết xem [docs/environment_setup.md](docs/environment_setup.md).
+See [docs/environment_setup.md](docs/environment_setup.md) for detailed Windows-specific build notes.
 
 ---
 
-## Sử Dụng / Usage
+## Usage
 
-### 1. Kiểm tra dataset
+### 1. Generate the Hybrid Workspace
 
 ```bash
-python VAI_NVS_CODE/scripts/inspect_dataset.py --data_dir VAI_NVS_DATA/phase1
+python scripts/build_taming_absgs.py \
+    --taming-root VAI_NVS_CODE/external/taming-3dgs \
+    --absgs-root VAI_NVS_CODE/external/absgs \
+    --output-root outputs/taming-absgs \
+    --overwrite
+
+python scripts/verify_taming_absgs.py \
+    --hybrid-root outputs/taming-absgs
 ```
 
-### 2. Training
+### 2. Inspect Dataset
 
 ```bash
-# Train một scene
-python VAI_NVS_CODE/external/taming-3dgs/train.py \
-  -s VAI_NVS_DATA/phase1/public_set/hcm0031/train \
-  -m outputs/checkpoints/hcm0031 \
-  --iterations 30000
-
-# Train song song nhiều scene
-python VAI_NVS_CODE/scripts/train_parallel.py
+python scripts/inspect_dataset.py --data_dir VAI_NVS_DATA/phase1
 ```
 
-### 3. Render test poses
+### 3. Training
 
 ```bash
-python VAI_NVS_CODE/scripts/render_parallel.py
+# Single scene
+python outputs/taming-absgs/train.py \
+    -s VAI_NVS_DATA/phase1/public_set/hcm0031/train \
+    -m outputs/checkpoints/hcm0031 \
+    --iterations 30000
+
+# Multiple scenes across 2 GPUs
+python scripts/train_parallel.py \
+    --hybrid-root outputs/taming-absgs \
+    --model-dir outputs/checkpoints \
+    --scenes "hcm0031:/data/hcm0031/train:hcm0031" \
+             "hcm0034:/data/hcm0034/train:hcm0034"
 ```
 
-### 4. Đánh giá local (chỉ trên public set)
+### 4. Render Test Poses
 
 ```bash
-python VAI_NVS_CODE/scripts/evaluate_predictions.py \
-  --pred_dir outputs/renders \
-  --gt_dir VAI_NVS_DATA/phase1/public_set
+# Single GPU
+python scripts/render_poses.py \
+    --taming-root outputs/taming-absgs \
+    --model-path outputs/checkpoints/hcm0031 \
+    --poses-csv VAI_NVS_DATA/phase1/public_set/hcm0031/test/test_poses.csv \
+    --output-dir outputs/renders/hcm0031
+
+# Parallel across 2 GPUs
+python scripts/render_parallel.py \
+    --taming-root outputs/taming-absgs \
+    --model-path outputs/checkpoints/hcm0031 \
+    --poses-csv VAI_NVS_DATA/phase1/public_set/hcm0031/test/test_poses.csv \
+    --output-dir outputs/renders/hcm0031
 ```
 
-### 5. Đóng gói submission
+### 5. Local Evaluation (public set only)
 
 ```bash
-python VAI_NVS_CODE/scripts/package_submission.py \
-  --render_dir outputs/renders \
-  --output submission.zip
+python scripts/evaluate_predictions.py \
+    --pred_dir outputs/renders \
+    --gt_dir VAI_NVS_DATA/phase1/public_set
+```
+
+### 6. Package Submission
+
+```bash
+python scripts/package_submission.py \
+    --render_dir outputs/renders \
+    --output submission.zip
 ```
 
 ---
 
-## Cấu Trúc Submission
+## Submission Format
 
 ```
 submission.zip
@@ -189,53 +262,45 @@ submission.zip
 └── ...
 ```
 
-**Yêu cầu bắt buộc:**
-- Đúng số lượng và tên scene
-- Đúng tên file ảnh
-- Đúng kích thước ảnh (theo `width x height` trong `test_poses.csv`)
-- Đúng số lượng ảnh mỗi scene
+**Requirements:**
+- Correct scene count and scene IDs
+- Correct image filenames (as specified in `test_poses.csv`)
+- Correct image dimensions (`width × height` from `test_poses.csv`)
+- Correct number of images per scene
+
+> ⚠️ Missing or extra scenes/images will cause the submission to be **rejected**.
 
 ---
 
-## Lịch Thi
+## Competition Schedule
 
-| Vòng | Thời gian | Hình thức |
+| Round | Period | Format |
 |---|---|---|
-| Vòng 1 — Sơ loại | 01/07/2026 → 30/07/2026 | File ZIP (GPU) |
-| Vòng 2 — Sơ khảo | 16/08/2026 → 19/08/2026 | File ZIP (GPU) |
-| Vòng 3 — Chung kết | 08/09/2026 → 10/09/2026 | File ZIP (GPU) |
+| Round 1 — Qualification | Jul 1 – Jul 30, 2026 | ZIP upload (GPU) |
+| Round 2 — Semi-finals | Aug 16 – Aug 19, 2026 | ZIP upload (GPU) |
+| Round 3 — Finals | Sep 8 – Sep 10, 2026 | ZIP upload (GPU) |
 
 ---
 
-## Quy Định
+## Rules
 
-- Chỉ sử dụng dữ liệu do BTC cung cấp
-- Không dùng dữ liệu ngoài liên quan đến scene/đối tượng trong đề
-- Không truy xuất hoặc suy đoán ground-truth private test
-- Không chỉnh sửa thủ công ảnh đầu ra
-- Kết quả phải có khả năng tái lập (mã nguồn, config, dependencies, checkpoints, logs)
-
----
-
-## Tài Liệu Tham Khảo
-
-- [3D Gaussian Splatting for Real-Time Radiance Field Rendering](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) — Kerbl et al., SIGGRAPH 2023
-- [Taming-3DGS](https://github.com/humansensinglab/taming-3dgs) — Mallick et al., ECCV 2024
-- [AbsGS](https://github.com/Zhenyu-Yang22/AbsGS) — Yang et al., 2024
-- [LPIPS — The Unreasonable Effectiveness of Deep Features as a Perceptual Metric](https://arxiv.org/abs/1801.03924) — Zhang et al., CVPR 2018
+- Only competition-provided data may be used for training
+- No external data related to the competition scenes or objects
+- No access or inference of private test ground truth
+- No manual editing of output images — all renders must be fully automated
+- Results must be reproducible (source code, configs, dependencies, checkpoints, logs)
 
 ---
 
-## Tác Giả / Author
+## References
 
-**huylu** (hopeSo00810)
+- [3D Gaussian Splatting for Real-Time Radiance Field Rendering](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) — Kerbl, Kopanas, Leimkühler & Drettakis, SIGGRAPH 2023
+- [Taming 3DGS: High-Quality Radiance Fields with Controlled Gaussian Count](https://github.com/humansensinglab/taming-3dgs) — Mallick et al., ECCV 2024
+- [AbsGS: Recovering Fine Details in 3D Gaussian Splatting](https://github.com/Zhenyu-Yang22/AbsGS) — Yang et al., ACM MM 2024
+- [The Unreasonable Effectiveness of Deep Features as a Perceptual Metric](https://arxiv.org/abs/1801.03924) — Zhang, Isola, Efros, Shechtman & Wang, CVPR 2018
 
 ---
 
 ## License
 
-Dự án nghiên cứu phục vụ cuộc thi Viettel AI Race 2026. Các external repos (`external/`, `VAI_NVS_CODE/external/`) giữ license gốc của từng dự án.
-
----
-
-*README prepared with Claude Code*
+This project is developed for the Viettel AI Race 2026 competition. See [LICENSE](LICENSE) for details. External repositories under `external/` and `VAI_NVS_CODE/external/` retain their original licenses.
