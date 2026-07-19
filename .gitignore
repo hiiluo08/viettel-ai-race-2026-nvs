@@ -91,3 +91,13 @@ htmlcov/
 *.tar.gz
 *.7z
 *.rar
+
+# ---------------------------------------------------------------------------
+# Internal planning & Kaggle runbooks (not needed for public repo)
+# ---------------------------------------------------------------------------
+docs/superpowers/
+docs/phase1_nvs_high_score_plan.md
+scripts/kaggle_taming_absgs.md
+scripts/kaggle_taming_absgs_dual_gpu.md
+VAI_NVS_CODE/scripts/kaggle_taming_absgs.md
+VAI_NVS_CODE/scripts/kaggle_taming_absgs_dual_gpu.md
