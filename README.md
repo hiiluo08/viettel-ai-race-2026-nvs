@@ -118,9 +118,7 @@ ViettelAIRace2026/
 │   │   ├── inspect_dataset.py          #   Dataset structure auditor
 │   │   ├── verify_colmap_scene.py      #   COLMAP model validator
 │   │   ├── show_rendered_images.py     #   Side-by-side render vs. GT viewer
-│   │   ├── nvs_utils.py               #   Shared utilities (path/pose/COLMAP I/O)
-│   │   ├── kaggle_taming_absgs.md      #   Kaggle runbook (single GPU)
-│   │   └── kaggle_taming_absgs_dual_gpu.md  # Kaggle runbook (dual GPU)
+│   │   └── nvs_utils.py                #   Shared utilities (path/pose/COLMAP I/O)
 │   └── external/                       # 3DGS variant implementations
 │       ├── taming-3dgs/                #   Taming-3DGS (score-based budget control)
 │       └── absgs/                      #   AbsGS (absolute gradient split)
