@@ -10,7 +10,7 @@
 
 The goal is to build an AI model that reconstructs a 3D spatial structure of a scene from multi-view images and synthesizes photorealistic RGB images at **novel camera viewpoints** never seen during training.
 
-| | |
+| Key | Description |
 |---|---|
 | **Input** | Multi-view images + camera poses + COLMAP sparse reconstruction |
 | **Output** | RGB images rendered at specified test poses |
@@ -33,20 +33,24 @@ Our approach combines two complementary improvements over the original 3D Gaussi
 
 **1. Gaussian Importance Score.** Each Gaussian is ranked by a multi-factor score that aggregates geometry and photometric signals across all training views:
 
-- **Geometry factors** ($G$): normalized view-space gradient magnitude, opacity, median depth, projected radii, and scale
-- **Photometric factors** ($P$): per-pixel L1 loss, accumulated blending weight, transmittance-weighted distance, and inverse ray count
+- **Geometry factors** (*G*): normalized view-space gradient magnitude, opacity, median depth, projected radii, and scale
+- **Photometric factors** (*P*): per-pixel L1 loss, accumulated blending weight, transmittance-weighted distance, and inverse ray count
 
-The importance of Gaussian $i$ for view $v$ is:
+The importance of Gaussian *i* for view *v* is:
 
-$$S_i^{(v)} = w_v \cdot \mathcal{L}_{\text{photo}}^{(v)} \cdot \left(P_i^{(v)} + G_i^{(v)}\right)$$
+```
+S_i(v) = w_v · L_photo(v) · (P_i(v) + G_i(v))
+```
 
-Scores are summed across all validation views, and only the top-$k$ Gaussians (controlled by a budget schedule) survive densification and pruning. This ensures training stays within a predictable memory envelope.
+Scores are summed across all validation views, and only the top-*k* Gaussians (controlled by a budget schedule) survive densification and pruning. This ensures training stays within a predictable memory envelope.
 
-**2. Budget Scheduling.** The target Gaussian count $B(t)$ follows a quadratic ramp from the initial count $N_0$ to the final budget $B_{\text{final}}$ over $T$ densification steps (Eq. 2 in the paper):
+**2. Budget Scheduling.** The target Gaussian count *B(t)* follows a quadratic ramp from the initial count *N₀* to the final budget *B_final* over *T* densification steps (Eq. 2 in the paper):
 
-$$B(t) = a t^2 + b t + N_0$$
+```
+B(t) = a·t² + b·t + N₀
+```
 
-where $a, b$ are derived from the slope lower bound $\frac{B_{\text{final}} - N_0}{T}$. This prevents both early overshoot and late-stage starvation.
+where *a, b* are derived from the slope lower bound *(B_final − N₀) / T*. This prevents both early overshoot and late-stage starvation.
 
 **3. Loss-Guided Rendering.** An edge-aware loss map weights the photometric loss spatially, emphasizing high-detail regions (edges detected via PIL's `FIND_EDGES` filter). The training loss combines L1 and a DSSIM term with the learned loss map.
 
@@ -56,7 +60,7 @@ where $a, b$ are derived from the slope lower bound $\frac{B_{\text{final}} - N_
 
 [AbsGS](https://github.com/Zhenyu-Yang22/AbsGS) (Yang et al., 2024) identifies a subtle failure mode in 3DGS densification: the **homodirectional gradient cancellation** problem. When neighboring pixels push a large Gaussian in opposite directions, the signed gradient components cancel out during atomic accumulation, so the Gaussian's gradient norm falls below the densification threshold — even though the Gaussian is clearly under-representing the scene.
 
-AbsGS fixes this by accumulating **per-pixel absolute gradients** ($\sum |\partial \mathcal{L} / \partial x|$, $\sum |\partial \mathcal{L} / \partial y|$) in the CUDA backward pass, alongside the standard signed gradients. Since absolute values never cancel, large, under-resolved Gaussians reliably exceed the split threshold.
+AbsGS fixes this by accumulating **per-pixel absolute gradients** (`Σ|∂L/∂x|`, `Σ|∂L/∂y|`) in the CUDA backward pass, alongside the standard signed gradients. Since absolute values never cancel, large, under-resolved Gaussians reliably exceed the split threshold.
 
 ### Hybrid Architecture
 
@@ -79,19 +83,21 @@ Clone candidates  →  norm(signed_gradient) >= densify_grad_threshold     (Tami
 Split candidates  →  norm(abs_gradient)    >= densify_grad_abs_threshold  (AbsGS contribution)
 ```
 
-Small Gaussians ($\max(\text{scale}) \le \text{percent\_dense} \times \text{extent}$) are cloned using Taming's normal gradient — preserving the ability to populate empty regions. Large Gaussians ($\max(\text{scale}) > \text{percent\_dense} \times \text{extent}$) are split using AbsGS's absolute gradient — preventing the cancellation problem on under-resolved structures. Taming scores still **rank** all candidates, so the budget schedule and quality-driven pruning remain in effect.
+Small Gaussians (`max(scale) ≤ percent_dense × extent`) are cloned using Taming's normal gradient — preserving the ability to populate empty regions. Large Gaussians (`max(scale) > percent_dense × extent`) are split using AbsGS's absolute gradient — preventing the cancellation problem on under-resolved structures. Taming scores still **rank** all candidates, so the budget schedule and quality-driven pruning remain in effect.
 
 ### Scoring Formula
 
 The competition evaluates rendered images against hidden ground truth using a weighted combination:
 
-$$\text{Score} = 0.4 \times (1 - \text{LPIPS}) + 0.3 \times \text{SSIM} + 0.3 \times \text{PSNR}_\text{norm}$$
+```
+Score = 0.4 × (1 − LPIPS) + 0.3 × SSIM + 0.3 × PSNR_norm
+```
 
 | Metric | What it measures | Target |
 |---|---|---|
 | **LPIPS** (Zhang et al., CVPR 2018) | Perceptual similarity via deep features (AlexNet) | Lower |
 | **SSIM** | Structural similarity (luminance, contrast, structure) | Higher |
-| **PSNR** (normalized) | Pixel-level error, clamped to $[0, 1]$ | Higher |
+| **PSNR** (normalized) | Pixel-level error, clamped to `[0, 1]` | Higher |
 
 The leaderboard score is the **average across all scenes**.
 
